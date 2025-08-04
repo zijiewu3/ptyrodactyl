@@ -33,7 +33,7 @@ def contrast_stretch(series,p1,p2):
   transformed = np.array([exposure.rescale_intensity(im, (np.percentile(im,p1), np.percentile(im,p2))) for im in series_reshaped])
   return transformed.reshape(series.shape)
 import re
-def parse_xyz(file_path):
+def parse_xyz(file_path, element_specified = True):
     """
     Parses an XYZ file and returns a list of atoms with their element symbols and 3D coordinates.
 
@@ -45,7 +45,10 @@ def parse_xyz(file_path):
         comment (str): The comment line in the XYZ file.
     """
     atoms = []
-    periodic_table = {'C': 5, 'Bi': 82, 'S': 15, 'Mo': 41, 'Se': 33, 'H':0 }
+    if element_specified:
+        periodic_table = {'C': 5, 'Bi': 82, 'S': 15, 'Mo': 41, 'Se': 33, 'H':0 }
+    else:
+        periodic_table = {str(i): i for i in range(1, 119)}
     with open(file_path, 'r') as f:
         lines = f.readlines()
 
