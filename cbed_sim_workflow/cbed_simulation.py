@@ -299,24 +299,24 @@ def reciprocal_lattice(cell):
     b3 = 2 * jnp.pi * jnp.cross(a1, a2) / V
     return jnp.stack([b1, b2, b3])
 
-def compute_min_repeats(cell, threshold_nm):
+def compute_min_repeats(cell, threshold_A):
     """
     Compute the minimal number of repeats along each lattice vector
-    so that the resulting supercell length exceeds `threshold_nm`.
+    so that the resulting supercell length exceeds `threshold_A`.
 
     Parameters:
     - cell: (3, 3) real-space lattice (rows = a1, a2, a3)
-    - threshold_nm: float, length threshold in nm
+    - threshold_A: float, length threshold in A
 
     Returns:
     - nx, ny, nz: integers
     """
     # Compute norms of lattice vectors
     lengths = jnp.linalg.norm(cell, axis=1)  # shape (3,)
-    n_repeats = jnp.ceil(threshold_nm / lengths).astype(int)
+    n_repeats = jnp.ceil(threshold_A / lengths).astype(int)
     return tuple(n_repeats)
 
-def expand_periodic_images_minimal(coords, cell, threshold_nm):
+def expand_periodic_images_minimal(coords, cell, threshold_A):
     """
     Expand coordinates in all directions just enough to exceed (twice of) a minimum
     bounding box size along each axis.
@@ -330,7 +330,7 @@ def expand_periodic_images_minimal(coords, cell, threshold_nm):
     - expanded_coords: (M, 3)
     - nx, ny, nz: number of repeats used in each direction
     """
-    nx, ny, nz = compute_min_repeats(cell, threshold_nm)
+    nx, ny, nz = compute_min_repeats(cell, threshold_A)
     nz = 0  # Set nz to 0 for 2D expansion
 
     i = jnp.arange(-nx, nx + 1)
@@ -476,11 +476,11 @@ def build_slice_wrapper(coords, sorted_order, slice_bounds, kirkland_jax, pixel_
     return [build_slice_i(i) for i in range(len(slice_bounds)-1)]
 
 
-def overall_wrapper(atoms, metadata, zone_hkl, theta, pixel_size, kirkland_jax, poss = [[0,0]]):
+def overall_wrapper(atoms, metadata, zone_hkl, theta, pixel_size, kirkland_jax, poss = [[0,0]], threshold_A = 10):
     tic = time.time()
     atoms_jnp = jnp.asarray(atoms, dtype=jnp.float32)
     metadata_jnp = jnp.asarray(metadata['lattice'], dtype=jnp.float32)
-    expanded_coords, (nx, ny, nz) = expand_periodic_images_minimal(atoms_jnp, metadata_jnp, 10)
+    expanded_coords, (nx, ny, nz) = expand_periodic_images_minimal(atoms_jnp, metadata_jnp, threshold_A)
     expanded_coords = jnp.hstack((expanded_coords[:, 0:1], expanded_coords[:, 1:4] - jnp.mean(expanded_coords[:, 1:4], axis=0)))  # Center the coordinates
     recip = reciprocal_lattice(metadata['lattice'])
     zone_vector = zone_hkl @ recip
