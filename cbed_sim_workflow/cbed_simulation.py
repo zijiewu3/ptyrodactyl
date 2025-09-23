@@ -33,6 +33,7 @@ def contrast_stretch(series,p1,p2):
   transformed = np.array([exposure.rescale_intensity(im, (np.percentile(im,p1), np.percentile(im,p2))) for im in series_reshaped])
   return transformed.reshape(series.shape)
 import re
+import json
 def parse_xyz(file_path, element_specified = True):
     """
     Parses an XYZ file and returns a list of atoms with their element symbols and 3D coordinates.
@@ -46,7 +47,10 @@ def parse_xyz(file_path, element_specified = True):
     """
     atoms = []
     if element_specified:
-        periodic_table = {'C': 5, 'Bi': 82, 'S': 15, 'Mo': 41, 'Se': 33, 'H':0 }
+        current_script_path = __file__
+        current_directory = '/'.join(current_script_path.split('/')[:-1])
+        periodic_table_path = current_directory + '/atom_numbers.json'
+        periodic_table = json.load(open(periodic_table_path))
     else:
         periodic_table = {str(i): i for i in range(1, 119)}
     with open(file_path, 'r') as f:
@@ -285,6 +289,7 @@ def rotate_structure(coords, cell, R, theta=0):
         # Apply in-plane rotation if needed
         in_plane_rotation = rotation_matrix_about_axis(jnp.array([0, 0, 1]), theta)
         rotated_coords_in_plane = rotated_coords[:, 1:4] @ in_plane_rotation.T
+        rotated_cell = rotated_cell @ in_plane_rotation.T
         rotated_coords = jnp.hstack((rotated_coords[:, 0:1], rotated_coords_in_plane))
     return rotated_coords, rotated_cell
 
@@ -499,7 +504,7 @@ def overall_wrapper(atoms, metadata, zone_hkl, theta, pixel_size, kirkland_jax, 
         slices_array = slices_array[:, :, slices_array.shape[2]//2-slices_array.shape[1]//2:slices_array.shape[2]//2+slices_array.shape[1]//2]
     else:
         slices_array = slices_array[:, slices_array.shape[1]//2-slices_array.shape[2]//2:slices_array.shape[1]//2+slices_array.shape[2]//2, :]
-    probe = make_probe(aperture=5,
+    probe = make_probe(aperture=2.5,
                    voltage = 100,
                    defocus = 0.0,
                    image_size = jnp.array(slices_array[0].shape),
@@ -542,3 +547,83 @@ def overall_wrapper(atoms, metadata, zone_hkl, theta, pixel_size, kirkland_jax, 
     
 
     return cbed_patterns, slices, rotated_coords, rotated_cell
+
+
+def overall_wrapper_rotate_first(atoms, metadata, zone_hkl, theta, pixel_size, kirkland_jax, poss = [[0,0]], threshold_A = 10, perturbation = 0.0, max_slices = 10000):
+    tic = time.time()
+    atoms_jnp = jnp.asarray(atoms, dtype=jnp.float32)
+    atoms_jnp = jnp.hstack((atoms_jnp[:, 0:1], atoms_jnp[:, 1:4] - jnp.mean(atoms_jnp[:, 1:4], axis=0)))  # Center the coordinates
+    metadata_jnp = jnp.asarray(metadata['lattice'], dtype=jnp.float32)
+
+    recip = reciprocal_lattice(metadata['lattice'])
+    zone_vector = zone_hkl @ recip
+    rotation = rotation_matrix_from_vectors(zone_vector, jnp.array(zone_hkl))
+    rotated_coords, rotated_cell = rotate_structure(atoms_jnp, metadata_jnp, rotation, theta)
+
+
+    expanded_coords, (nx, ny, nz) = expand_periodic_images_minimal(rotated_coords, rotated_cell, threshold_A)
+    #perturb the coordinates
+    expanded_coords = np.array(expanded_coords)
+    expanded_coords[:,1:4] += np.random.normal(size = expanded_coords[:,1:4].shape)*perturbation
+    expanded_coords = jnp.asarray(expanded_coords, dtype=jnp.float32)
+    #expanded_coords = jnp.hstack((expanded_coords[:, 0:1], expanded_coords[:, 1:4] - jnp.mean(expanded_coords[:, 1:4], axis=0)))  # Center the coordinates
+    
+# i-x-h, j-y-w
+    
+    sorted_coords, slice_bounds, z_min, z_max = slice_atoms(expanded_coords, slice_thickness = 1) # in Angstrom
+    slices = build_slice_wrapper(expanded_coords, sorted_coords, slice_bounds, kirkland_jax, pixel_size)
+    if len(slices) > max_slices:
+        slices = slices[:max_slices]
+    
+
+    
+    slices_array = np.array(slices)
+    #chop slices_array down to squares
+    if slices_array.shape[2] > slices_array.shape[1]:
+        slices_array = slices_array[:, :, slices_array.shape[2]//2-slices_array.shape[1]//2:slices_array.shape[2]//2+slices_array.shape[1]//2]
+    else:
+        slices_array = slices_array[:, slices_array.shape[1]//2-slices_array.shape[2]//2:slices_array.shape[1]//2+slices_array.shape[2]//2, :]
+    probe = make_probe(aperture=2.5,
+                   voltage = 100,
+                   defocus = 0.0,
+                   image_size = jnp.array(slices_array[0].shape),
+                   calibration_pm = pixel_size*100,
+                   #defocus = -0.0,
+                   #c3=0.0,
+                   #c5=0.0
+
+                   )
+    probe= probe[:,:, jnp.newaxis]
+
+    # Reorganize the slices so that the third dimension becomes the first dimension
+    slices_array = np.moveaxis(slices_array, 0, -1)
+
+    slices_array = jnp.asarray(slices_array, dtype = jnp.complex64)
+
+    sigma = 0.001 #/(V*Angstrom) at 100 kV
+
+    phase_shift = jnp.exp(-1j * sigma * slices_array)
+
+    pot_slices = PotentialSlices(phase_shift, 1.0, 0.1)
+    beam = ProbeModes(probe, jnp.array([1.0]), calib = 0.1)
+    toc = time.time()
+    print("Time taken for preprocessing:", toc - tic, "seconds")
+
+    #cbed = cbed(slices_array, probe, jnp.asarray([[200.0, 200.0]]), jnp.asarray(bin_size, dtype= jnp.float16), jnp.asarray(100), 0.1)
+    poss = np.array(poss)
+    center_pixel = np.array([slices_array.shape[0] // 2, slices_array.shape[1] // 2])
+    pixel_shifts = poss/pixel_size
+    pixels = jnp.asarray(pixel_shifts + center_pixel, dtype=jnp.float32)
+
+    #cbed_pattern = jax.jit(cbed)(pot_slices, beam, 100.0)
+    cbed_patterns = stem_4D(pot_slice = pot_slices,
+                            beam = beam,
+                            positions = pixels,
+                            voltage_kV = 100.0,
+                            calib_ang = pixel_size
+                            )
+    print("time taken for cbed calculation:", time.time() - toc, "seconds")
+    
+
+    return cbed_patterns, slices, rotated_coords, rotated_cell
+
