@@ -290,6 +290,7 @@ def rotate_structure(coords, cell, R, theta=0):
         in_plane_rotation = rotation_matrix_about_axis(jnp.array([0, 0, 1]), theta)
         rotated_coords_in_plane = rotated_coords[:, 1:4] @ in_plane_rotation.T
         rotated_cell = rotated_cell @ in_plane_rotation.T
+        #print("in-plane rotated cell", rotated_cell)
         rotated_coords = jnp.hstack((rotated_coords[:, 0:1], rotated_coords_in_plane))
     return rotated_coords, rotated_cell
 
@@ -321,7 +322,80 @@ def compute_min_repeats(cell, threshold_A):
     n_repeats = jnp.ceil(threshold_A / lengths).astype(int)
     return tuple(n_repeats)
 
-def expand_periodic_images_minimal(coords, cell, threshold_A):
+import jax.numpy as jnp
+import math
+
+def supercell_span(cell, n):
+    """Return (span_x, span_y, span_z) of the supercell with integer multipliers n=(na,nb,nc).
+       cell: (3,3) rows = a, b, c (Cartesian)
+    """
+    a, b, c = cell
+    a_s, b_s, c_s = n[0]*a, n[1]*b, n[2]*c
+    corners = jnp.stack([
+        jnp.array([0.0, 0.0, 0.0]),
+        a_s, b_s, c_s,
+        a_s + b_s, a_s + c_s, b_s + c_s,
+        a_s + b_s + c_s
+    ])  # (8,3)
+    mins = corners.min(axis=0)
+    maxs = corners.max(axis=0)
+    return maxs - mins  # (3,) = (span_x, span_y, span_z)
+
+
+def find_minimal_replication(cell, target_x, target_y, max_n=8, metric="volume"):
+    """
+    Search for minimal (na,nb,nc) with span_x >= target_x and span_y >= target_y.
+    max_n: search upper bound for each multiplier (increase if necessary).
+    metric: "volume" -> minimize na*nb*nc; "area" -> minimize na*nb (ties broken by nc).
+    """
+    best = None
+    best_score = None
+
+    for na in range(1, max_n + 1):
+        for nb in range(1, max_n + 1):
+            for nc in range(1, max_n + 1):
+                span = supercell_span(cell, (na, nb, nc))
+                if (span[0] >= target_x) and (span[1] >= target_y):
+                    if metric == "volume":
+                        score = na * nb * nc
+                    elif metric == "area":
+                        score = na * nb + 1e-6 * nc
+                    else:
+                        score = na * nb * nc
+                    if (best is None) or (score < best_score):
+                        best = (na, nb, nc)
+                        best_score = score
+
+    if best is None:
+        raise ValueError(f"No solution up to max_n={max_n}. Increase max_n or change rotation.")
+    return best
+
+def find_minimal_replication_by_projection(cell, target_x, target_y, plane_ortho = jnp.array([0,0,1])):
+    
+    def project_onto_plane(P, Q):
+
+        # Q is the plane normal
+        return (P - (jnp.dot(P, Q) / jnp.dot(Q, Q)) * Q) 
+    #find which two cell vectors have the longest projections onto the plane
+    projs = jnp.array([project_onto_plane(a, plane_ortho) for a in cell])
+    #find the two largest projections
+    lengths = jnp.linalg.norm(projs, axis=1)
+    lengths = lengths / jnp.linalg.norm(cell, axis=1)
+    
+    largest_indices = jnp.argsort(lengths)[-2:]
+    
+    cell_2d = projs[largest_indices]
+
+    n1 = jnp.ceil(target_x / jnp.linalg.norm(cell_2d[0])).astype(int)
+    n2 = jnp.ceil(target_y / jnp.linalg.norm(cell_2d[1])).astype(int)
+
+    ns = [0, 0, 0]
+    ns[largest_indices[0]] = int(n1)
+    ns[largest_indices[1]] = int(n2)
+
+    return ns[0], ns[1], ns[2]
+
+def expand_periodic_images_minimal(coords, cell, threshold_A, search = False):
     """
     Expand coordinates in all directions just enough to exceed (twice of) a minimum
     bounding box size along each axis.
@@ -335,9 +409,12 @@ def expand_periodic_images_minimal(coords, cell, threshold_A):
     - expanded_coords: (M, 3)
     - nx, ny, nz: number of repeats used in each direction
     """
-    nx, ny, nz = compute_min_repeats(cell, threshold_A)
-    nz = 0  # Set nz to 0 for 2D expansion
-
+    if not search:
+        nx, ny, nz = compute_min_repeats(cell, threshold_A)
+        nz = 0  # Set nz to 0 for 2D expansion
+    else:
+        #nx, ny, nz = find_minimal_replication(cell, target_x=threshold_A, target_y=threshold_A, max_n=8, metric="volume")
+        nx, ny, nz = find_minimal_replication_by_projection(cell, target_x=threshold_A, target_y=threshold_A, plane_ortho = jnp.array([0,0,1]))
     i = jnp.arange(-nx, nx + 1)
     j = jnp.arange(-ny, ny + 1)
     k = jnp.arange(-nz, nz + 1)
@@ -464,9 +541,13 @@ def build_slice_wrapper(coords, sorted_order, slice_bounds, kirkland_jax, pixel_
     y_min = jnp.min(coords[:, 2])
     H = jnp.ceil((x_max - x_min) / pixel_size).astype(int)
     W = jnp.ceil((y_max - y_min) / pixel_size).astype(int)
+    
     def build_slice_i(i):
         i = int(i)
-        atoms_in_slice_i = sorted_order[slice_bounds[i]:slice_bounds[i+1]]
+        if i == len(slice_bounds)-1:
+            atoms_in_slice_i = sorted_order[slice_bounds[i]:]
+        else:
+            atoms_in_slice_i = sorted_order[slice_bounds[i]:slice_bounds[i+1]]
         if len(atoms_in_slice_i) == 0:
             return jnp.zeros((H, W))        
         coords_in_slice = coords[atoms_in_slice_i]
@@ -478,10 +559,10 @@ def build_slice_wrapper(coords, sorted_order, slice_bounds, kirkland_jax, pixel_
             kirkland_jax
         )
         return canvas
-    return [build_slice_i(i) for i in range(len(slice_bounds)-1)]
+    return [build_slice_i(i) for i in range(len(slice_bounds))]
 
 
-def overall_wrapper(atoms, metadata, zone_hkl, theta, pixel_size, kirkland_jax, poss = [[0,0]], threshold_A = 10):
+def overall_wrapper(atoms, metadata, zone_hkl, theta, pixel_size, kirkland_jax, poss = [[0,0]], threshold_A = 10, **kwargs):
     tic = time.time()
     atoms_jnp = jnp.asarray(atoms, dtype=jnp.float32)
     metadata_jnp = jnp.asarray(metadata['lattice'], dtype=jnp.float32)
@@ -489,12 +570,17 @@ def overall_wrapper(atoms, metadata, zone_hkl, theta, pixel_size, kirkland_jax, 
     expanded_coords = jnp.hstack((expanded_coords[:, 0:1], expanded_coords[:, 1:4] - jnp.mean(expanded_coords[:, 1:4], axis=0)))  # Center the coordinates
     recip = reciprocal_lattice(metadata['lattice'])
     zone_vector = zone_hkl @ recip
-    rotation = rotation_matrix_from_vectors(zone_vector, jnp.array(zone_hkl))
+    rotation = rotation_matrix_from_vectors(zone_vector, jnp.array([0.0, 0.0, 1.0]))
+    #print("rotation matrix", rotation)
     rotated_coords, rotated_cell = rotate_structure(expanded_coords, metadata_jnp, rotation, theta)
 # i-x-h, j-y-w
     
     sorted_coords, slice_bounds, z_min, z_max = slice_atoms(rotated_coords, slice_thickness = 1) # in Angstrom
     slices = build_slice_wrapper(rotated_coords, sorted_coords, slice_bounds, kirkland_jax, pixel_size)
+
+    #pop the kwarg for defocus, default to 0
+    defocus = kwargs.get('defocus', 0.0)
+    probe_radius_mrad = kwargs.get('probe_radius_mrad', 2.5)
     
 
     
@@ -504,9 +590,9 @@ def overall_wrapper(atoms, metadata, zone_hkl, theta, pixel_size, kirkland_jax, 
         slices_array = slices_array[:, :, slices_array.shape[2]//2-slices_array.shape[1]//2:slices_array.shape[2]//2+slices_array.shape[1]//2]
     else:
         slices_array = slices_array[:, slices_array.shape[1]//2-slices_array.shape[2]//2:slices_array.shape[1]//2+slices_array.shape[2]//2, :]
-    probe = make_probe(aperture=2.5,
+    probe = make_probe(aperture=float(probe_radius_mrad),
                    voltage = 100,
-                   defocus = 0.0,
+                   defocus = float(defocus),
                    image_size = jnp.array(slices_array[0].shape),
                    calibration_pm = pixel_size*100,
                    #defocus = -0.0,
@@ -549,7 +635,11 @@ def overall_wrapper(atoms, metadata, zone_hkl, theta, pixel_size, kirkland_jax, 
     return cbed_patterns, slices, rotated_coords, rotated_cell
 
 
-def overall_wrapper_rotate_first(atoms, metadata, zone_hkl, theta, pixel_size, kirkland_jax, poss = [[0,0]], threshold_A = 10, perturbation = 0.0, max_slices = 10000):
+def overall_wrapper_rotate_first(atoms, metadata, zone_hkl, theta, pixel_size, kirkland_jax, poss = [[0,0]], threshold_A = 10, perturbation = 0.0, max_slices = 10000, **kwargs):
+    
+    defocus = kwargs.get('defocus', 0.0)
+    probe_radius_mrad = kwargs.get('probe_radius_mrad', 2.5)
+    
     tic = time.time()
     atoms_jnp = jnp.asarray(atoms, dtype=jnp.float32)
     atoms_jnp = jnp.hstack((atoms_jnp[:, 0:1], atoms_jnp[:, 1:4] - jnp.mean(atoms_jnp[:, 1:4], axis=0)))  # Center the coordinates
@@ -557,12 +647,15 @@ def overall_wrapper_rotate_first(atoms, metadata, zone_hkl, theta, pixel_size, k
 
     recip = reciprocal_lattice(metadata['lattice'])
     zone_vector = zone_hkl @ recip
-    rotation = rotation_matrix_from_vectors(zone_vector, jnp.array(zone_hkl))
+    rotation = rotation_matrix_from_vectors(zone_vector, jnp.array([0.0, 0.0, 1.0]))
+    #print("rotation matrix", rotation)
     rotated_coords, rotated_cell = rotate_structure(atoms_jnp, metadata_jnp, rotation, theta)
 
 
-    expanded_coords, (nx, ny, nz) = expand_periodic_images_minimal(rotated_coords, rotated_cell, threshold_A)
+    expanded_coords, (nx, ny, nz) = expand_periodic_images_minimal(rotated_coords, rotated_cell, threshold_A, search = True)
     #perturb the coordinates
+    #print(nx, ny, nz)
+    #print('expanded coords shape', expanded_coords.shape)
     expanded_coords = np.array(expanded_coords)
     expanded_coords[:,1:4] += np.random.normal(size = expanded_coords[:,1:4].shape)*perturbation
     expanded_coords = jnp.asarray(expanded_coords, dtype=jnp.float32)
@@ -575,17 +668,20 @@ def overall_wrapper_rotate_first(atoms, metadata, zone_hkl, theta, pixel_size, k
     if len(slices) > max_slices:
         slices = slices[:max_slices]
     
+    
 
     
     slices_array = np.array(slices)
+    #print(slices_array.shape)
+    #print(slices_array)
     #chop slices_array down to squares
     if slices_array.shape[2] > slices_array.shape[1]:
         slices_array = slices_array[:, :, slices_array.shape[2]//2-slices_array.shape[1]//2:slices_array.shape[2]//2+slices_array.shape[1]//2]
     else:
         slices_array = slices_array[:, slices_array.shape[1]//2-slices_array.shape[2]//2:slices_array.shape[1]//2+slices_array.shape[2]//2, :]
-    probe = make_probe(aperture=2.5,
+    probe = make_probe(aperture=float(probe_radius_mrad),
                    voltage = 100,
-                   defocus = 0.0,
+                   defocus = float(defocus),
                    image_size = jnp.array(slices_array[0].shape),
                    calibration_pm = pixel_size*100,
                    #defocus = -0.0,
@@ -625,5 +721,5 @@ def overall_wrapper_rotate_first(atoms, metadata, zone_hkl, theta, pixel_size, k
     print("time taken for cbed calculation:", time.time() - toc, "seconds")
     
 
-    return cbed_patterns, slices, rotated_coords, rotated_cell
+    return cbed_patterns, slices, expanded_coords, rotated_cell
 
