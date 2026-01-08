@@ -6,7 +6,11 @@ import cv2
 from model_training import save_cbed_data
 import itertools
 import numpy as np
+import gc
 import tqdm
+import jax
+import jax.profiler
+
 all_possible_zones = [[0,0,1],
                       [0,1,1],
                       [1,1,1],
@@ -39,10 +43,11 @@ with open('atom_numbers.json', 'r') as f:
     atom_numbers = json.load(f)
 
 from cbed_simulation import overall_wrapper_rotate_first
-for structure in tqdm.tqdm(all_structures[:]):
+for structure in tqdm.tqdm(all_structures[9:]):
     h5_filename = f'{structure}/simulated_cbed_2.5mrad.h5'
     
-    for zone_axis in all_possible_zones_permutations[:]:
+    for zone_axis in tqdm.tqdm(all_possible_zones_permutations[:]):
+        print(f'Simulating {structure} along zone axis {zone_axis}')
         entries = []
         for perturbation in [0.0, 0.25, 0.5]:  # Different levels of perturbation
             for rot in np.random.uniform(0, jnp.pi, 2):  # Random rotation
@@ -52,7 +57,7 @@ for structure in tqdm.tqdm(all_structures[:]):
                 poss = jnp.array([[0,0]])
                 # 2.5 mrad semiangle at 100 kV has a probe diameter of about 2 nm
                 cbed_patterns_2, slices_2, test_rotated_coords_2, test_rotated_cells_2 = overall_wrapper_rotate_first(atoms, metadata, zone_hkl = jnp.array(zone_axis), theta = rot, pixel_size = 0.1, kirkland_jax=kirkland_jax
-                                                                                                , poss = poss, threshold_A = 80, perturbation = perturbation )
+                                                                                                , poss = poss, threshold_A = 50, perturbation = perturbation, max_slices = 80 )
                 
                 calibration_length = 2.5 #A-1
                 calibration_length_pixels = int(calibration_length / cbed_patterns_2.calib_x[0])
@@ -72,4 +77,10 @@ for structure in tqdm.tqdm(all_structures[:]):
                         "scale": calibration_length/cropped_data.shape[0]
                     }
                 entries.append(entry)
+
         save_cbed_data(h5_filename, entries)
+        jax.clear_caches()
+        del cbed_patterns_2, slices_2, test_rotated_coords_2, test_rotated_cells_2, data
+        gc.collect()
+        jax.profiler.save_device_memory_profile(f"mem_{zone_axis}.prof")
+        

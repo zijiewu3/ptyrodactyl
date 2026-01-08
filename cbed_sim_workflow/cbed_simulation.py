@@ -464,6 +464,53 @@ def slice_atoms(coords, slice_thickness):
 
     return sorted_order, slice_bounds, z_min, z_max
 
+def build_atomic_distance_lookup_by_slice(sorted_order, slice_bounds, coords, r_max=5.0):
+    """
+    Build a lookup table of atomic distances for each slice.
+
+    Parameters:
+    - sorted_order: (N,) array of atom indices sorted by slice
+    - slice_bounds: list of start indices for each slice in sorted_order
+    - coords: (N, 4) array of atomic coordinates
+    - r_max: float, maximum distance to consider
+
+    Returns:
+    - distance_lookup: list of (M_i, 3) arrays of atomic positions for each slice i
+    """
+    from scipy.spatial import cKDTree
+    distance_lookup = []
+    atom_indices_by_slice = []
+    n_slices = len(slice_bounds)
+    for i in range(n_slices):
+        if i == n_slices - 1:
+            atom_indices = sorted_order[slice_bounds[i]:]
+        else:
+            atom_indices = sorted_order[slice_bounds[i]:slice_bounds[i + 1]]
+        atom_indices_by_slice.append(atom_indices)
+        slice_coords = coords[atom_indices, 1:4]  # (M_i, 3)
+        kdtree = cKDTree(slice_coords[:, :2])
+        # for each atom in slice_coords, find neighbors within a cutoff (e.g., 5 angstroms) 
+        # and add the ids of the two atoms and their distance to lookup
+        all_neighbors = kdtree.query_ball_point(slice_coords[:, :2], r=r_max)
+        all_neighbor_pairs = []
+        for idx, neighbors in enumerate(all_neighbors):
+            for n in neighbors:
+                if n > idx:
+                    all_neighbor_pairs.append([atom_indices[idx], atom_indices[n]])
+        all_neighbor_pairs = np.array(all_neighbor_pairs)
+        # append a third column for distance
+        if len(all_neighbor_pairs) > 0:
+            diffs = coords[all_neighbor_pairs[:, 0], 1:3] - coords[all_neighbor_pairs[:, 1], 1:3]
+            dists = np.linalg.norm(diffs, axis=1)
+            all_neighbor_pairs = np.hstack((all_neighbor_pairs, dists[:, np.newaxis]))
+        distance_lookup.append(all_neighbor_pairs)
+    return atom_indices_by_slice, distance_lookup
+            
+
+
+
+    return distance_lookup
+
 def build_slice_potential(coords, canvas_shape, minmaxes, pixel_size, atomic_potential_fn):
     """
     Sum 2D atomic potentials into a slice canvas, clipping contributions
@@ -723,3 +770,31 @@ def overall_wrapper_rotate_first(atoms, metadata, zone_hkl, theta, pixel_size, k
 
     return cbed_patterns, slices, expanded_coords, rotated_cell
 
+def convert_to_sk(cbed_pattern, n_radial, r_max = None):
+    """
+    Convert a 2D CBED pattern to 1D S(k) profile by radial averaging.
+    Parameters:
+    - cbed_pattern: (H, W) 2D array
+    - n_radial: int, number of radial bins
+    Returns:
+    - sk_profile: (n_radial,) 1D array
+    """
+    H, W = cbed_pattern.shape
+    center = jnp.array([H // 2, W // 2])
+    y, x = jnp.indices((H, W))
+    r = jnp.sqrt((x - center[1])**2 + (y - center[0])**2)
+    r_max = jnp.max(r) if r_max is None else r_max
+
+    radial_bins = jnp.linspace(0, r_max, n_radial + 1)
+
+    sk_profile = jnp.zeros(n_radial)
+    counts = jnp.zeros(n_radial)
+
+    for i in range(n_radial):
+        mask = (r >= radial_bins[i]) & (r < radial_bins[i + 1])
+        sk_profile = sk_profile.at[i].set(jnp.sum(cbed_pattern[mask]))
+        counts = counts.at[i].set(jnp.sum(mask.astype(jnp.float32)))
+
+    sk_profile = jnp.where(counts > 0, sk_profile / counts, 0)
+
+    return radial_bins, sk_profile
